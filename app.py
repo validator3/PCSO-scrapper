@@ -48,16 +48,13 @@ def scrape_pcso_results():
 
     soup = BeautifulSoup(response.text, 'html.parser')
 
-    # Remove script and style tags
     for tag in soup(['script', 'style', 'nav', 'footer']):
         tag.decompose()
 
-    # Get clean text
     text = soup.get_text(separator='\n')
     lines = [l.strip() for l in text.split('\n') if l.strip()]
 
     logger.info(f"Got {len(lines)} lines of content")
-    # Log first 20 lines to see what we're working with
     logger.info(f"First 20 lines: {lines[:20]}")
     return lines
 
@@ -81,8 +78,6 @@ def find_block(lines, keyword, num_lines=50):
     return []
 
 
-# ---------- PARSING FUNCTIONS WITH ERROR LOGGING ----------
-
 def parse_big_game(lines, keyword, num_count):
     try:
         block = find_block(lines, keyword, 50)
@@ -91,21 +86,18 @@ def parse_big_game(lines, keyword, num_count):
 
         block_text = ' '.join(block)
 
-        # Extract date
         date_match = re.search(
             r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}',
             block_text
         )
         date = date_match.group(0) if date_match else None
 
-        # Extract numbers
         pattern = r'\b(\d{1,2}\s+){%d}\d{1,2}\b' % (num_count - 1)
         num_match = re.search(pattern, block_text)
         numbers = None
         if num_match:
             numbers = '-'.join(re.findall(r'\d{1,2}', num_match.group(0)))
 
-        # Extract jackpot
         jackpot_match = re.search(r'(?:Jackpot|Prize):\s*([\d,]+(?:\.\d{2})?)', block_text)
         jackpot = jackpot_match.group(1) if jackpot_match else None
 
@@ -114,7 +106,6 @@ def parse_big_game(lines, keyword, num_count):
     except Exception as e:
         logger.error(f"Error in parse_big_game for '{keyword}': {e}")
         logger.error(traceback.format_exc())
-        # Re-raise to let the route handler catch it
         raise Exception(f"parse_big_game error: {e}")
 
 
@@ -126,7 +117,6 @@ def parse_slot_game(lines, keyword, num_count):
 
         block_text = ' '.join(block)
 
-        # Extract date
         date_match = re.search(
             r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}',
             block_text
@@ -135,10 +125,9 @@ def parse_slot_game(lines, keyword, num_count):
 
         slots = {}
         for slot in ['2PM', '5PM', '9PM']:
-            # Build pattern: slot name followed by num_count numbers
-            # e.g. for 3D: r'2PM\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})'
-            pattern = r'{}\s+' + r'\s+'.join([r'(\d{1,2})'] * num_count)
-            pattern = pattern.format(re.escape(slot))
+            # Build pattern without using .format() to avoid braces conflict with regex quantifiers
+            num_pattern = r'\s+'.join([r'(\d{1,2})'] * num_count)
+            pattern = re.escape(slot) + r'\s+' + num_pattern
             match = re.search(pattern, block_text)
             if match:
                 slots[slot] = '-'.join(match.groups())
