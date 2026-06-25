@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 import pytz
 import re
+import traceback
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -56,12 +57,9 @@ def scrape_pcso_results():
     lines = [l.strip() for l in text.split('\n') if l.strip()]
 
     logger.info(f"Got {len(lines)} lines of content")
+    # Log first 20 lines to see what we're working with
+    logger.info(f"First 20 lines: {lines[:20]}")
     return lines
-
-
-def is_number_line(line, min_nums=2):
-    parts = line.strip().split()
-    return all(p.isdigit() for p in parts) and len(parts) >= min_nums
 
 
 def parse_date(line):
@@ -76,76 +74,81 @@ def find_block(lines, keyword, num_lines=50):
     """Find a block of lines starting from the line containing keyword."""
     for i, line in enumerate(lines):
         if keyword.lower() in line.lower():
-            return lines[i:i + num_lines]
+            block = lines[i:i + num_lines]
+            logger.info(f"Found block for '{keyword}' at line {i}, first few lines: {block[:5]}")
+            return block
+    logger.warning(f"No block found for '{keyword}'")
     return []
 
 
-# ---------- UPDATED PARSING FUNCTIONS ----------
+# ---------- PARSING FUNCTIONS WITH ERROR LOGGING ----------
 
 def parse_big_game(lines, keyword, num_count):
-    """
-    Extract numbers, date, and jackpot for a big game (6-number or 4-number)
-    using regex on the block text.
-    """
-    block = find_block(lines, keyword, 50)
-    if not block:
-        return {'numbers': None, 'date': None, 'jackpot': None}
+    try:
+        block = find_block(lines, keyword, 50)
+        if not block:
+            return {'numbers': None, 'date': None, 'jackpot': None}
 
-    # Join block into one string to make regex easier
-    block_text = ' '.join(block)
+        block_text = ' '.join(block)
 
-    # Extract date (e.g., "Jun 24, 2026")
-    date_match = re.search(
-        r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}',
-        block_text
-    )
-    date = date_match.group(0) if date_match else None
+        # Extract date
+        date_match = re.search(
+            r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}',
+            block_text
+        )
+        date = date_match.group(0) if date_match else None
 
-    # Extract numbers: look for exactly num_count numbers (1-2 digits) separated by whitespace
-    # This pattern matches a sequence like "41 29 27 21 33 19"
-    pattern = r'\b(\d{1,2}\s+){%d}\d{1,2}\b' % (num_count - 1)
-    num_match = re.search(pattern, block_text)
-    numbers = None
-    if num_match:
-        numbers = '-'.join(re.findall(r'\d{1,2}', num_match.group(0)))
+        # Extract numbers
+        pattern = r'\b(\d{1,2}\s+){%d}\d{1,2}\b' % (num_count - 1)
+        num_match = re.search(pattern, block_text)
+        numbers = None
+        if num_match:
+            numbers = '-'.join(re.findall(r'\d{1,2}', num_match.group(0)))
 
-    # Extract jackpot / prize
-    jackpot_match = re.search(r'(?:Jackpot|Prize):\s*([\d,]+(?:\.\d{2})?)', block_text)
-    jackpot = jackpot_match.group(1) if jackpot_match else None
+        # Extract jackpot
+        jackpot_match = re.search(r'(?:Jackpot|Prize):\s*([\d,]+(?:\.\d{2})?)', block_text)
+        jackpot = jackpot_match.group(1) if jackpot_match else None
 
-    return {'numbers': numbers, 'date': date, 'jackpot': jackpot}
+        return {'numbers': numbers, 'date': date, 'jackpot': jackpot}
+
+    except Exception as e:
+        logger.error(f"Error in parse_big_game for '{keyword}': {e}")
+        logger.error(traceback.format_exc())
+        # Re-raise to let the route handler catch it
+        raise Exception(f"parse_big_game error: {e}")
 
 
 def parse_slot_game(lines, keyword, num_count):
-    """
-    Extract date and slots (2PM, 5PM, 9PM) for 3D and 2D games.
-    Handles lines like "2PM    7    6    1".
-    """
-    block = find_block(lines, keyword, 50)
-    if not block:
-        return {'date': None, 'slots': {}}
+    try:
+        block = find_block(lines, keyword, 50)
+        if not block:
+            return {'date': None, 'slots': {}}
 
-    block_text = ' '.join(block)
+        block_text = ' '.join(block)
 
-    # Extract date
-    date_match = re.search(
-        r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}',
-        block_text
-    )
-    date = date_match.group(0) if date_match else None
+        # Extract date
+        date_match = re.search(
+            r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}',
+            block_text
+        )
+        date = date_match.group(0) if date_match else None
 
-    slots = {}
-    # For each time slot, build a regex to capture the numbers after it
-    for slot in ['2PM', '5PM', '9PM']:
-        # Build pattern: slot name followed by num_count numbers
-        # e.g. for 3D: r'2PM\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})'
-        pattern = r'{}\s+' + r'\s+'.join([r'(\d{1,2})'] * num_count)
-        pattern = pattern.format(re.escape(slot))
-        match = re.search(pattern, block_text)
-        if match:
-            slots[slot] = '-'.join(match.groups())
+        slots = {}
+        for slot in ['2PM', '5PM', '9PM']:
+            # Build pattern: slot name followed by num_count numbers
+            # e.g. for 3D: r'2PM\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})'
+            pattern = r'{}\s+' + r'\s+'.join([r'(\d{1,2})'] * num_count)
+            pattern = pattern.format(re.escape(slot))
+            match = re.search(pattern, block_text)
+            if match:
+                slots[slot] = '-'.join(match.groups())
 
-    return {'date': date, 'slots': slots}
+        return {'date': date, 'slots': slots}
+
+    except Exception as e:
+        logger.error(f"Error in parse_slot_game for '{keyword}': {e}")
+        logger.error(traceback.format_exc())
+        raise Exception(f"parse_slot_game error: {e}")
 
 
 def parse_results(lines):
@@ -159,7 +162,6 @@ def parse_results(lines):
         'slot_games': {}
     }
 
-    # Big games – using shorter, more reliable keywords to match the page headers
     big_games = [
         ('6/58 Ultra Lotto', 'Ultra Lotto', 6),
         ('6/55 Grand Lotto', 'Grand Lotto', 6),
@@ -173,8 +175,6 @@ def parse_results(lines):
     for game_name, keyword, num_count in big_games:
         results['big_games'][game_name] = parse_big_game(lines, keyword, num_count)
 
-    # Slot games – use distinct keywords that appear only in the game section,
-    # not in the page title or other places.
     results['slot_games']['3D Lotto'] = parse_slot_game(lines, '3D Lotto', 3)
     results['slot_games']['2D EZ2']   = parse_slot_game(lines, '2D Lotto', 2)
 
@@ -212,8 +212,6 @@ def format_message(results):
     return '\n'.join(lines)
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok', 'time': get_manila_time().strftime('%Y-%m-%d %H:%M:%S PHT')})
@@ -226,7 +224,8 @@ def get_results():
         results = parse_results(lines)
         return jsonify({'success': True, 'data': results})
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Route error: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -238,7 +237,8 @@ def get_message():
         message = format_message(results)
         return jsonify({'success': True, 'message': message})
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Route error: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
