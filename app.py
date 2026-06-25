@@ -1,235 +1,202 @@
-from flask import Flask, jsonify
-import requests
-from bs4 import BeautifulSoup
-import logging
-from datetime import datetime
-import pytz
 import re
-import traceback
+import requests
+import logging
+from datetime import datetime, timezone, timedelta
+from flask import Flask, jsonify
+from bs4 import BeautifulSoup
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+
+# ----------------------------------------------------------------------
+# Logging setup – trace everything so you can debug easily on Railway
+# ----------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-MANILA_TZ = pytz.timezone('Asia/Manila')
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
 
-
-def get_manila_time():
-    return datetime.now(MANILA_TZ)
-
-
-def get_draw_slot(now):
-    hour = now.hour
-    if hour < 14:
-        return 'Pre-draw'
-    elif hour < 17:
-        return '2PM Draw'
-    elif hour < 21:
-        return '5PM Draw'
-    else:
-        return '9PM Draw'
-
-
-def scrape_pcso_results():
-    """Scrape PCSO lotto results using requests + BeautifulSoup"""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-    }
-
-    logger.info("Fetching lottobot.ai...")
-    response = requests.get(
-        'https://lottobot.ai/pcso-lotto-results-today',
-        headers=headers,
-        timeout=30
-    )
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, 'html.parser')
-
-    for tag in soup(['script', 'style', 'nav', 'footer']):
-        tag.decompose()
-
-    text = soup.get_text(separator='\n')
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
-
-    logger.info(f"Got {len(lines)} lines of content")
-    logger.info(f"First 20 lines: {lines[:20]}")
+def fetch_page():
+    """Download the lotto results page and return stripped text lines."""
+    url = "https://lottobot.ai/pcso-lotto-results/"
+    logger.info("Fetching %s", url)
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    # Extract all visible text from the page
+    text = soup.get_text(separator="\n")
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    logger.info("Fetched %d lines", len(lines))
     return lines
 
 
-def parse_date(line):
-    months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-              'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-    if any(m in line for m in months) and re.search(r'\d{4}', line):
-        return line.strip()
-    return None
-
-
-def find_block(lines, keyword, num_lines=50):
-    """Find a block of lines starting from the line containing keyword."""
+def find_block(lines, keyword, block_size=50):
+    """
+    Locate the first occurrence of `keyword` (case‑insensitive) and return
+    a block of `block_size` lines starting from that line.
+    """
     for i, line in enumerate(lines):
         if keyword.lower() in line.lower():
-            block = lines[i:i + num_lines]
-            logger.info(f"Found block for '{keyword}' at line {i}, first few lines: {block[:5]}")
-            return block
-    logger.warning(f"No block found for '{keyword}'")
+            logger.info("Keyword '%s' found at line %d: %s", keyword, i, line)
+            return lines[i : i + block_size]
+    logger.warning("Keyword '%s' not found", keyword)
     return []
 
 
 def parse_big_game(lines, keyword, num_count):
-    try:
-        block = find_block(lines, keyword, 50)
-        if not block:
-            return {'numbers': None, 'date': None, 'jackpot': None}
+    """
+    Parse a big game (6/58, 6/55, etc.) from a 50‑line block.
+    Returns dict with 'numbers', 'date', 'jackpot'.
+    """
+    block = find_block(lines, keyword, 50)
+    if not block:
+        return {"numbers": None, "date": None, "jackpot": None}
+    block_text = " ".join(block)
 
-        block_text = ' '.join(block)
+    # Date: e.g., "Jun 24, 2026" (comma optional)
+    date_match = re.search(
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}",
+        block_text,
+    )
+    date = date_match.group(0) if date_match else None
 
-        date_match = re.search(
-            r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}',
-            block_text
-        )
-        date = date_match.group(0) if date_match else None
+    # Numbers: exactly num_count groups of 1‑ or 2‑digit numbers
+    # Pattern: (num_count-1) groups of \d{1,2}\s+ then a final \d{1,2}
+    pattern = r"\b(\d{1,2}\s+){%d}\d{1,2}\b" % (num_count - 1)
+    num_match = re.search(pattern, block_text)
+    numbers = None
+    if num_match:
+        numbers = "-".join(re.findall(r"\d{1,2}", num_match.group(0)))
 
-        pattern = r'\b(\d{1,2}\s+){%d}\d{1,2}\b' % (num_count - 1)
-        num_match = re.search(pattern, block_text)
-        numbers = None
-        if num_match:
-            numbers = '-'.join(re.findall(r'\d{1,2}', num_match.group(0)))
+    # Jackpot/Prize
+    jackpot_match = re.search(
+        r"(?:Jackpot|Prize):\s*([\d,]+(?:\.\d{2})?)", block_text
+    )
+    jackpot = jackpot_match.group(1) if jackpot_match else None
 
-        jackpot_match = re.search(r'(?:Jackpot|Prize):\s*([\d,]+(?:\.\d{2})?)', block_text)
-        jackpot = jackpot_match.group(1) if jackpot_match else None
-
-        return {'numbers': numbers, 'date': date, 'jackpot': jackpot}
-
-    except Exception as e:
-        logger.error(f"Error in parse_big_game for '{keyword}': {e}")
-        logger.error(traceback.format_exc())
-        raise Exception(f"parse_big_game error: {e}")
+    logger.info(
+        "Big game %s: date=%s, numbers=%s, jackpot=%s",
+        keyword, date, numbers, jackpot,
+    )
+    return {"numbers": numbers, "date": date, "jackpot": jackpot}
 
 
 def parse_slot_game(lines, keyword, num_count):
+    """
+    Parse a slot game (3D, 2D) from a 50‑line block.
+    Returns dict with 'date' and 'slots' { '2PM': '...', '5PM': '...', '9PM': '...' }.
+    """
+    block = find_block(lines, keyword, 50)
+    if not block:
+        return {"date": None, "slots": {}}
+    block_text = " ".join(block)
+
+    # Date
+    date_match = re.search(
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}",
+        block_text,
+    )
+    date = date_match.group(0) if date_match else None
+
+    slots = {}
+    for slot in ["2PM", "5PM", "9PM"]:
+        # Build regex: slot label followed by num_count digit groups.
+        # The curly braces in \d{1,2} must be escaped for Python's .format()
+        escaped_slot = re.escape(slot)
+        # \d{{1,2}} -> literal {1,2} after .format()
+        pattern = r"{}\s+" + r"\s+".join([r"(\d{{1,2}})"] * num_count)
+        pattern = pattern.format(escaped_slot)
+        match = re.search(pattern, block_text)
+        if match:
+            slots[slot] = "-".join(match.groups())
+
+    logger.info("Slot game %s: date=%s, slots=%s", keyword, date, slots)
+    return {"date": date, "slots": slots}
+
+
+def get_draw_slot():
+    """
+    Determine if we are before or after the 9 PM draw.
+    Philippines time (UTC+8). Returns "Pre‑draw" or "Post‑draw".
+    """
+    tz = timezone(timedelta(hours=8))
+    now = datetime.now(tz)
+    return "Post-draw" if now.hour >= 21 else "Pre-draw"
+
+
+# ----------------------------------------------------------------------
+# Flask routes
+# ----------------------------------------------------------------------
+
+@app.route("/")
+def home():
+    return jsonify({"status": "online", "endpoints": ["/results", "/message"]})
+
+
+@app.route("/results")
+def results():
     try:
-        block = find_block(lines, keyword, 50)
-        if not block:
-            return {'date': None, 'slots': {}}
+        lines = fetch_page()
+    except Exception as e:
+        logger.error("Error fetching page: %s", e, exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
 
-        block_text = ' '.join(block)
+    try:
+        # Big games – (display name, keyword to find, number count)
+        big_games = [
+            ("6/58 Ultra Lotto", "Ultra Lotto", 6),
+            ("6/55 Grand Lotto", "Grand Lotto", 6),
+            ("6/49 Super Lotto", "Super Lotto", 6),
+            ("6/45 Mega Lotto",  "Mega Lotto",  6),
+            ("6/42 Lotto",       "6/42",        6),
+            ("6D Lotto",         "6D Lotto",    6),
+            ("4D Lotto",         "4D Lotto",    4),
+        ]
 
-        date_match = re.search(
-            r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}',
-            block_text
+        data = {
+            "big_games": {},
+            "slot_games": {},
+            "draw_slot": get_draw_slot(),
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # Parse each big game
+        for name, keyword, count in big_games:
+            data["big_games"][name] = parse_big_game(lines, keyword, count)
+
+        # Slot games – careful with the keywords to avoid false matches
+        data["slot_games"]["3D Lotto"] = parse_slot_game(lines, "3D Lotto", 3)
+        data["slot_games"]["2D EZ2"]   = parse_slot_game(lines, "2D Lotto", 2)
+
+        return jsonify({"success": True, "data": data})
+    except Exception as e:
+        logger.error("Error parsing results: %s", e, exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/message")
+def message():
+    """Return a human‑readable summary of latest results."""
+    try:
+        lines = fetch_page()
+    except Exception as e:
+        logger.error("Error fetching page for message: %s", e, exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    big = parse_big_game(lines, "Ultra Lotto", 6)
+    if big["numbers"] and big["date"] and big["jackpot"]:
+        msg = (
+            f"PCSO 6/58 Ultra Lotto result for {big['date']}:\n"
+            f"{big['numbers']} – Jackpot: ₱{big['jackpot']}"
         )
-        date = date_match.group(0) if date_match else None
-
-        slots = {}
-        for slot in ['2PM', '5PM', '9PM']:
-            # Build pattern without using .format() to avoid braces conflict with regex quantifiers
-            num_pattern = r'\s+'.join([r'(\d{1,2})'] * num_count)
-            pattern = re.escape(slot) + r'\s+' + num_pattern
-            match = re.search(pattern, block_text)
-            if match:
-                slots[slot] = '-'.join(match.groups())
-
-        return {'date': date, 'slots': slots}
-
-    except Exception as e:
-        logger.error(f"Error in parse_slot_game for '{keyword}': {e}")
-        logger.error(traceback.format_exc())
-        raise Exception(f"parse_slot_game error: {e}")
+    else:
+        msg = "PCSO results are not available at the moment."
+    return jsonify({"success": True, "message": msg})
 
 
-def parse_results(lines):
-    now = get_manila_time()
-
-    results = {
-        'scraped_at': now.strftime('%Y-%m-%d %H:%M:%S PHT'),
-        'today': now.strftime('%B %d, %Y'),
-        'draw_slot': get_draw_slot(now),
-        'big_games': {},
-        'slot_games': {}
-    }
-
-    big_games = [
-        ('6/58 Ultra Lotto', 'Ultra Lotto', 6),
-        ('6/55 Grand Lotto', 'Grand Lotto', 6),
-        ('6/49 Super Lotto', 'Super Lotto', 6),
-        ('6/45 Mega Lotto',  'Mega Lotto',  6),
-        ('6/42 Lotto',       '6/42',        6),
-        ('6D Lotto',         '6D Lotto',    6),
-        ('4D Lotto',         '4D Lotto',    4),
-    ]
-
-    for game_name, keyword, num_count in big_games:
-        results['big_games'][game_name] = parse_big_game(lines, keyword, num_count)
-
-    results['slot_games']['3D Lotto'] = parse_slot_game(lines, '3D Lotto', 3)
-    results['slot_games']['2D EZ2']   = parse_slot_game(lines, '2D Lotto', 2)
-
-    return results
-
-
-def format_message(results):
-    lines = []
-    lines.append(f"PCSO Results - {results['today']}")
-    lines.append(f"({results['draw_slot']})")
-    lines.append('')
-
-    for game_name, data in results['big_games'].items():
-        if data['numbers']:
-            date_str = f" ({data['date']})" if data['date'] else ''
-            jackpot   = f" | {data['jackpot']}" if data['jackpot'] else ''
-            lines.append(f"{game_name}{date_str}: {data['numbers']}{jackpot}")
-        else:
-            lines.append(f"{game_name}: No draw today")
-
-    lines.append('')
-
-    for game_name, data in results['slot_games'].items():
-        if data['slots']:
-            date_str = f" ({data['date']})" if data['date'] else ''
-            lines.append(f"{game_name}{date_str}:")
-            for slot in ['2PM', '5PM', '9PM']:
-                lines.append(f"  {slot}: {data['slots'].get(slot, 'pending')}")
-        else:
-            lines.append(f"{game_name}: No draw today")
-
-    lines.append('')
-    lines.append('Good luck!')
-
-    return '\n'.join(lines)
-
-
-@app.route('/health')
-def health():
-    return jsonify({'status': 'ok', 'time': get_manila_time().strftime('%Y-%m-%d %H:%M:%S PHT')})
-
-
-@app.route('/results')
-def get_results():
-    try:
-        lines   = scrape_pcso_results()
-        results = parse_results(lines)
-        return jsonify({'success': True, 'data': results})
-    except Exception as e:
-        logger.error(f"Route error: {e}")
-        logger.error(traceback.format_exc())
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/message')
-def get_message():
-    try:
-        lines   = scrape_pcso_results()
-        results = parse_results(lines)
-        message = format_message(results)
-        return jsonify({'success': True, 'message': message})
-    except Exception as e:
-        logger.error(f"Route error: {e}")
-        logger.error(traceback.format_exc())
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=False)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
