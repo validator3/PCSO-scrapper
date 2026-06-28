@@ -58,11 +58,6 @@ def get_ph_now():
 
 
 def get_draw_context():
-    """
-    Returns a dict describing the current draw period and result context.
-    Before the first draw of the day we explicitly flag that results
-    shown are from the PREVIOUS day so consumers are never misled.
-    """
     now = get_ph_now()
     today_str     = now.strftime("%B %d, %Y")
     yesterday     = now - timedelta(days=1)
@@ -73,32 +68,28 @@ def get_draw_context():
             "draw_slot":         "Post-draw (9PM)",
             "is_todays_result":  True,
             "result_date_label": today_str,
-            "status_message":    f"Showing today's results ({today_str}) after the 9PM draw.",
+            "status_message":    f"Today's PCSO Lotto Results ({today_str}) - 9PM Draw",
         }
     elif now.hour >= 17:
         return {
             "draw_slot":         "Post-draw (5PM)",
             "is_todays_result":  True,
             "result_date_label": today_str,
-            "status_message":    f"Showing today's results ({today_str}) after the 5PM draw.",
+            "status_message":    f"Today's PCSO Lotto Results ({today_str}) - 5PM Draw",
         }
     elif now.hour >= 14:
         return {
             "draw_slot":         "Post-draw (2PM)",
             "is_todays_result":  True,
             "result_date_label": today_str,
-            "status_message":    f"Showing today's results ({today_str}) after the 2PM draw.",
+            "status_message":    f"Today's PCSO Lotto Results ({today_str}) - 2PM Draw",
         }
     else:
         return {
             "draw_slot":         "Pre-draw",
             "is_todays_result":  False,
             "result_date_label": yesterday_str,
-            "status_message": (
-                f"No draws yet today ({today_str}). "
-                f"Showing the most recent results from {yesterday_str}. "
-                "Next draw is at 2:00 PM Philippine time."
-            ),
+            "status_message":    f"Latest PCSO Results ({yesterday_str}) | Next draw today at 2:00 PM PH time",
         }
 
 
@@ -166,7 +157,7 @@ def parse_big_game(lines, display_name, keywords, num_count):
         "date":    extract_date(block_text),
         "jackpot": extract_jackpot(block_text),
     }
-    logger.info("%s → %s", display_name, result)
+    logger.info("%s -> %s", display_name, result)
     return result
 
 
@@ -177,19 +168,18 @@ def parse_slot_game(lines, display_name, keywords, num_count):
     block_text = " ".join(block)
     slots = {}
     for draw_time in DRAW_TIMES:
-        pattern = re.escape(draw_time) + r"[\s:–\-]*([\d\s\-]+)"
+        pattern = re.escape(draw_time) + r"[\s:-]*([\d\s-]+)"
         match = re.search(pattern, block_text, re.IGNORECASE)
         if match:
             nums = re.findall(r"\d{1,2}", match.group(1))[:num_count]
             if len(nums) == num_count:
                 slots[draw_time] = "-".join(nums)
     result = {"date": extract_date(block_text), "slots": slots}
-    logger.info("%s → %s", display_name, result)
+    logger.info("%s -> %s", display_name, result)
     return result
 
 
 def has_any_results(big_games, slot_games):
-    """Return True if at least one game has non-null numbers."""
     for g in big_games.values():
         if g.get("numbers"):
             return True
@@ -200,7 +190,6 @@ def has_any_results(big_games, slot_games):
 
 
 def detect_actual_result_date(big_games, slot_games):
-    """Pull the first non-null date found across all games."""
     for g in big_games.values():
         if g.get("date"):
             return g["date"]
@@ -244,14 +233,10 @@ def results():
         }
 
         ctx = get_draw_context()
-
-        # Override result_date_label with the actual scraped date if available
         actual_date = detect_actual_result_date(big_games, slot_games)
         if actual_date:
             ctx["result_date_label"] = actual_date
 
-        # Warn if pre-draw AND scraped date looks like today
-        # (shouldn't normally happen but good to surface)
         data_available = has_any_results(big_games, slot_games)
 
         return jsonify({
@@ -277,7 +262,11 @@ def results():
 
 @app.route("/message")
 def message():
-    """Plain-text summary — great for Telegram/SMS bots."""
+    """
+    Returns a clean, Messenger-friendly message.
+    Uses | as line separator so JSON stays valid and
+    n8n can pass it without breaking.
+    """
     try:
         html  = fetch_page()
         lines = extract_lines(html)
@@ -285,33 +274,37 @@ def message():
         return jsonify({"success": False, "error": str(e)}), 500
 
     ctx = get_draw_context()
+
+    # Build message lines using | as separator (no newlines in JSON)
     parts = [ctx["status_message"], ""]
 
     found_any = False
     for display_name, keywords, count in BIG_GAME_KEYWORDS:
         g = parse_big_game(lines, display_name, keywords, count)
         if g["numbers"] and g["date"]:
-            jp = f"\n   Jackpot: ₱{g['jackpot']}" if g.get("jackpot") else ""
-            parts.append(f"🎱 {display_name} ({g['date']})\n   {g['numbers']}{jp}")
+            jp = f" | Jackpot: P{g['jackpot']}" if g.get("jackpot") else ""
+            parts.append(f"{display_name} ({g['date']}): {g['numbers']}{jp}")
             found_any = True
 
     for display_name, keywords, count in SLOT_GAME_KEYWORDS:
         g = parse_slot_game(lines, display_name, keywords, count)
         if g.get("slots"):
-            slot_lines = "\n".join(
-                f"   {t}: {n}" for t, n in g["slots"].items()
-            )
-            parts.append(f"🎰 {display_name} ({g.get('date', 'N/A')})\n{slot_lines}")
+            slot_text = " | ".join(f"{t}: {n}" for t, n in g["slots"].items())
+            parts.append(f"{display_name} ({g.get('date', 'N/A')}): {slot_text}")
             found_any = True
 
     if not found_any:
-        parts.append("No results found. The site may be updating — please try again shortly.")
+        parts.append("No results found. The site may be updating - please try again shortly.")
+
+    # Join with newline — Flask jsonify will properly escape these
+    # so they arrive as \n in JSON and render as line breaks in Messenger
+    final_message = "\n".join(parts)
 
     return jsonify({
-        "success": True,
+        "success":          True,
         "is_todays_result": ctx["is_todays_result"],
-        "draw_slot": ctx["draw_slot"],
-        "message": "\n".join(parts),
+        "draw_slot":        ctx["draw_slot"],
+        "message":          final_message,
     })
 
 
@@ -336,7 +329,7 @@ def debug():
     ctx = get_draw_context()
 
     return jsonify({
-        "success":    True,
+        "success": True,
         "meta": {
             "draw_slot":        ctx["draw_slot"],
             "is_todays_result": ctx["is_todays_result"],
