@@ -32,7 +32,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-# Keywords to search for each game in the page text
 BIG_GAME_KEYWORDS = [
     ("6/58 Ultra Lotto", ["6/58", "Ultra Lotto 6/58", "Ultra Lotto"], 6),
     ("6/55 Grand Lotto", ["6/55", "Grand Lotto 6/55", "Grand Lotto"], 6),
@@ -51,20 +50,61 @@ SLOT_GAME_KEYWORDS = [
 DRAW_TIMES = ["11AM", "2PM", "4PM", "5PM", "9PM"]
 
 # ----------------------------------------------------------------------
-# Helpers
+# Time / context helpers
 # ----------------------------------------------------------------------
 
-def get_draw_slot():
-    now = datetime.now(PH_TZ)
-    if now.hour >= 21:
-        return "Post-draw (9PM)"
-    elif now.hour >= 17:
-        return "Post-draw (5PM)"
-    elif now.hour >= 14:
-        return "Post-draw (2PM)"
-    else:
-        return "Pre-draw"
+def get_ph_now():
+    return datetime.now(PH_TZ)
 
+
+def get_draw_context():
+    """
+    Returns a dict describing the current draw period and result context.
+    Before the first draw of the day we explicitly flag that results
+    shown are from the PREVIOUS day so consumers are never misled.
+    """
+    now = get_ph_now()
+    today_str     = now.strftime("%B %d, %Y")
+    yesterday     = now - timedelta(days=1)
+    yesterday_str = yesterday.strftime("%B %d, %Y")
+
+    if now.hour >= 21:
+        return {
+            "draw_slot":         "Post-draw (9PM)",
+            "is_todays_result":  True,
+            "result_date_label": today_str,
+            "status_message":    f"Showing today's results ({today_str}) after the 9PM draw.",
+        }
+    elif now.hour >= 17:
+        return {
+            "draw_slot":         "Post-draw (5PM)",
+            "is_todays_result":  True,
+            "result_date_label": today_str,
+            "status_message":    f"Showing today's results ({today_str}) after the 5PM draw.",
+        }
+    elif now.hour >= 14:
+        return {
+            "draw_slot":         "Post-draw (2PM)",
+            "is_todays_result":  True,
+            "result_date_label": today_str,
+            "status_message":    f"Showing today's results ({today_str}) after the 2PM draw.",
+        }
+    else:
+        return {
+            "draw_slot":         "Pre-draw",
+            "is_todays_result":  False,
+            "result_date_label": yesterday_str,
+            "status_message": (
+                f"No draws yet today ({today_str}). "
+                f"Showing the most recent results from {yesterday_str}. "
+                "Next draw is at 2:00 PM Philippine time."
+            ),
+        }
+
+
+# ----------------------------------------------------------------------
+# Scraping helpers
+# ----------------------------------------------------------------------
 
 def fetch_page(url=SOURCE_URL):
     logger.info("Fetching %s", url)
@@ -77,16 +117,14 @@ def fetch_page(url=SOURCE_URL):
 def extract_lines(html):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n")
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    return lines
+    return [l.strip() for l in text.split("\n") if l.strip()]
 
 
 def find_block(lines, keywords, block_size=60):
-    """Find first occurrence of any keyword and return surrounding lines."""
     for i, line in enumerate(lines):
         for kw in keywords:
             if kw.lower() in line.lower():
-                logger.info("Keyword '%s' found at line %d: %s", kw, i, line)
+                logger.info("Keyword '%s' found at line %d", kw, i)
                 return lines[i: i + block_size]
     logger.warning("Keywords %s not found", keywords)
     return []
@@ -103,12 +141,9 @@ def extract_date(text):
 
 
 def extract_numbers(text, count):
-    """Extract exactly `count` 1-or-2-digit numbers in sequence."""
-    pattern = r"(?<!\d)(\d{1,2})(?!\d)"
-    all_nums = re.findall(pattern, text)
-    # Slide a window looking for a valid sequence
-    for i in range(len(all_nums) - count + 1):
-        chunk = all_nums[i:i + count]
+    nums = re.findall(r"(?<!\d)(\d{1,2})(?!\d)", text)
+    for i in range(len(nums) - count + 1):
+        chunk = nums[i: i + count]
         if all(1 <= int(n) <= 58 for n in chunk):
             return "-".join(chunk)
     return None
@@ -125,36 +160,54 @@ def parse_big_game(lines, display_name, keywords, num_count):
     block = find_block(lines, keywords)
     if not block:
         return {"numbers": None, "date": None, "jackpot": None}
-
     block_text = " ".join(block)
-    date = extract_date(block_text)
-    numbers = extract_numbers(block_text, num_count)
-    jackpot = extract_jackpot(block_text)
-
-    logger.info("%s → date=%s numbers=%s jackpot=%s", display_name, date, numbers, jackpot)
-    return {"numbers": numbers, "date": date, "jackpot": jackpot}
+    result = {
+        "numbers": extract_numbers(block_text, num_count),
+        "date":    extract_date(block_text),
+        "jackpot": extract_jackpot(block_text),
+    }
+    logger.info("%s → %s", display_name, result)
+    return result
 
 
 def parse_slot_game(lines, display_name, keywords, num_count):
     block = find_block(lines, keywords)
     if not block:
         return {"date": None, "slots": {}}
-
     block_text = " ".join(block)
-    date = extract_date(block_text)
     slots = {}
-
     for draw_time in DRAW_TIMES:
-        # Look for pattern like "2PM 1-2" or "9PM 5 8 3"
-        pattern = re.escape(draw_time) + r"[\s:–-]*([\d\s\-]+)"
+        pattern = re.escape(draw_time) + r"[\s:–\-]*([\d\s\-]+)"
         match = re.search(pattern, block_text, re.IGNORECASE)
         if match:
             nums = re.findall(r"\d{1,2}", match.group(1))[:num_count]
             if len(nums) == num_count:
                 slots[draw_time] = "-".join(nums)
+    result = {"date": extract_date(block_text), "slots": slots}
+    logger.info("%s → %s", display_name, result)
+    return result
 
-    logger.info("%s → date=%s slots=%s", display_name, date, slots)
-    return {"date": date, "slots": slots}
+
+def has_any_results(big_games, slot_games):
+    """Return True if at least one game has non-null numbers."""
+    for g in big_games.values():
+        if g.get("numbers"):
+            return True
+    for g in slot_games.values():
+        if g.get("slots"):
+            return True
+    return False
+
+
+def detect_actual_result_date(big_games, slot_games):
+    """Pull the first non-null date found across all games."""
+    for g in big_games.values():
+        if g.get("date"):
+            return g["date"]
+    for g in slot_games.values():
+        if g.get("date"):
+            return g["date"]
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -164,38 +217,57 @@ def parse_slot_game(lines, display_name, keywords, num_count):
 @app.route("/")
 def home():
     return jsonify({
-        "status": "online",
-        "source": SOURCE_URL,
+        "status":    "online",
+        "source":    SOURCE_URL,
         "endpoints": ["/results", "/message", "/debug"],
-        "note": "Results available after 2PM, 5PM, 9PM Philippine time"
+        "note":      "Draws at 2PM, 5PM, 9PM Philippine time (UTC+8)",
     })
 
 
 @app.route("/results")
 def results():
     try:
-        html = fetch_page()
+        html  = fetch_page()
         lines = extract_lines(html)
     except Exception as e:
         logger.error("Fetch error: %s", e, exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
     try:
-        big_games = {}
-        for display_name, keywords, count in BIG_GAME_KEYWORDS:
-            big_games[display_name] = parse_big_game(lines, display_name, keywords, count)
+        big_games  = {
+            name: parse_big_game(lines, name, kws, cnt)
+            for name, kws, cnt in BIG_GAME_KEYWORDS
+        }
+        slot_games = {
+            name: parse_slot_game(lines, name, kws, cnt)
+            for name, kws, cnt in SLOT_GAME_KEYWORDS
+        }
 
-        slot_games = {}
-        for display_name, keywords, count in SLOT_GAME_KEYWORDS:
-            slot_games[display_name] = parse_slot_game(lines, display_name, keywords, count)
+        ctx = get_draw_context()
+
+        # Override result_date_label with the actual scraped date if available
+        actual_date = detect_actual_result_date(big_games, slot_games)
+        if actual_date:
+            ctx["result_date_label"] = actual_date
+
+        # Warn if pre-draw AND scraped date looks like today
+        # (shouldn't normally happen but good to surface)
+        data_available = has_any_results(big_games, slot_games)
 
         return jsonify({
             "success": True,
+            "meta": {
+                "draw_slot":         ctx["draw_slot"],
+                "is_todays_result":  ctx["is_todays_result"],
+                "result_date":       ctx["result_date_label"],
+                "status_message":    ctx["status_message"],
+                "data_available":    data_available,
+                "fetched_at":        datetime.now(timezone.utc).isoformat(),
+                "ph_time":           get_ph_now().strftime("%Y-%m-%d %H:%M:%S %Z"),
+            },
             "data": {
                 "big_games":  big_games,
                 "slot_games": slot_games,
-                "draw_slot":  get_draw_slot(),
-                "fetched_at": datetime.now(timezone.utc).isoformat(),
             }
         })
     except Exception as e:
@@ -205,41 +277,53 @@ def results():
 
 @app.route("/message")
 def message():
+    """Plain-text summary — great for Telegram/SMS bots."""
     try:
-        html = fetch_page()
+        html  = fetch_page()
         lines = extract_lines(html)
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+    ctx = get_draw_context()
+    parts = [ctx["status_message"], ""]
+
+    found_any = False
     for display_name, keywords, count in BIG_GAME_KEYWORDS:
         g = parse_big_game(lines, display_name, keywords, count)
         if g["numbers"] and g["date"]:
-            jp = f" — Jackpot: ₱{g['jackpot']}" if g.get("jackpot") else ""
-            return jsonify({
-                "success": True,
-                "message": f"PCSO {display_name} result for {g['date']}:\n{g['numbers']}{jp}"
-            })
+            jp = f"\n   Jackpot: ₱{g['jackpot']}" if g.get("jackpot") else ""
+            parts.append(f"🎱 {display_name} ({g['date']})\n   {g['numbers']}{jp}")
+            found_any = True
+
+    for display_name, keywords, count in SLOT_GAME_KEYWORDS:
+        g = parse_slot_game(lines, display_name, keywords, count)
+        if g.get("slots"):
+            slot_lines = "\n".join(
+                f"   {t}: {n}" for t, n in g["slots"].items()
+            )
+            parts.append(f"🎰 {display_name} ({g.get('date', 'N/A')})\n{slot_lines}")
+            found_any = True
+
+    if not found_any:
+        parts.append("No results found. The site may be updating — please try again shortly.")
 
     return jsonify({
         "success": True,
-        "message": (
-            "PCSO results are not yet available. "
-            "Please check after 2:05 PM, 5:05 PM, or 9:05 PM Philippine time."
-        )
+        "is_todays_result": ctx["is_todays_result"],
+        "draw_slot": ctx["draw_slot"],
+        "message": "\n".join(parts),
     })
 
 
 @app.route("/debug")
 def debug():
-    """Shows raw page lines and tables for troubleshooting."""
     try:
-        html = fetch_page()
+        html  = fetch_page()
+        lines = extract_lines(html)
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-    lines = extract_lines(html)
-
-    soup = BeautifulSoup(html, "html.parser")
+    soup   = BeautifulSoup(html, "html.parser")
     tables = []
     for i, tbl in enumerate(soup.find_all("table")):
         rows = []
@@ -249,13 +333,21 @@ def debug():
                 rows.append(cols)
         tables.append({"table_index": i, "rows": rows[:20]})
 
+    ctx = get_draw_context()
+
     return jsonify({
-        "success": True,
-        "draw_slot": get_draw_slot(),
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "success":    True,
+        "meta": {
+            "draw_slot":        ctx["draw_slot"],
+            "is_todays_result": ctx["is_todays_result"],
+            "result_date":      ctx["result_date_label"],
+            "status_message":   ctx["status_message"],
+            "ph_time":          get_ph_now().strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "fetched_at":       datetime.now(timezone.utc).isoformat(),
+        },
         "total_lines": len(lines),
-        "text_lines": lines[:200],
-        "tables": tables,
+        "text_lines":  lines[:200],
+        "tables":      tables,
     })
 
 
